@@ -41,7 +41,7 @@ RUNNING_KERNEL=$(uname -r)
 running_tree="/lib/modules/$RUNNING_KERNEL"
 
 apt-get update
-apt-get install -y build-essential dkms python3 pulseaudio-utils
+apt-get install -y build-essential dkms mokutil python3 pulseaudio-utils
 
 if [ ! -e "$running_tree/build/Makefile" ]; then
   apt-get install -y "linux-headers-$RUNNING_KERNEL"
@@ -266,9 +266,78 @@ install -m 0644 -o "$USER_UID" -g "$USER_GID" \
   "$ROOT/systemd/a720-volume-bridge.service.d/audio-ready.conf" \
   "$user_systemd/a720-volume-bridge.service.d/audio-ready.conf"
 
+configure_user_bridge() {
+  bridge_start=$1
+
+  if [ -d "$user_runtime" ]; then
+    su -s /bin/sh "$USER_NAME" -c \
+      "XDG_RUNTIME_DIR=$user_runtime systemctl --user daemon-reload"
+
+    if [ "$bridge_start" = yes ]; then
+      su -s /bin/sh "$USER_NAME" -c \
+        "XDG_RUNTIME_DIR=$user_runtime systemctl --user enable --now a720-volume-bridge.service"
+    else
+      su -s /bin/sh "$USER_NAME" -c \
+        "XDG_RUNTIME_DIR=$user_runtime systemctl --user enable a720-volume-bridge.service"
+    fi
+  else
+    install -d -o "$USER_UID" -g "$USER_GID" "$user_systemd/default.target.wants"
+    ln -sfn ../a720-volume-bridge.service \
+      "$user_systemd/default.target.wants/a720-volume-bridge.service"
+    chown -h "$USER_UID:$USER_GID" \
+      "$user_systemd/default.target.wants/a720-volume-bridge.service"
+    echo "User service enabled; it will start at next login."
+  fi
+}
+
+secure_boot_enabled=0
+mok_enrollment_required=0
+
+if mokutil --sb-state 2>/dev/null | grep -q '^SecureBoot enabled'; then
+  secure_boot_enabled=1
+
+  if [ ! -r /var/lib/dkms/mok.pub ]; then
+    echo "Secure Boot is enabled, but the DKMS public key is missing:" >&2
+    echo "  /var/lib/dkms/mok.pub" >&2
+    echo "Cannot verify whether the newly built module can be trusted." >&2
+    exit 1
+  fi
+
+  if ! mokutil --test-key /var/lib/dkms/mok.pub >/dev/null 2>&1; then
+    mok_enrollment_required=1
+  fi
+fi
+
 systemctl daemon-reload
 systemctl stop a720-wmi-handshake.service >/dev/null 2>&1 || true
-systemctl enable --now a720-wmi-handshake.service
+systemctl enable a720-wmi-handshake.service
+
+if [ "$secure_boot_enabled" -eq 1 ] && [ "$mok_enrollment_required" -eq 1 ]; then
+  configure_user_bridge no
+
+  echo
+  echo "A720 support is installed, but Secure Boot does not yet trust the DKMS signing key."
+  echo "The kernel module and both services have been staged for the next boot."
+  echo
+  echo "Enroll the DKMS key with:"
+  echo "  sudo mokutil --import /var/lib/dkms/mok.pub"
+  echo
+  echo "Then reboot, choose Enroll MOK in MokManager, confirm the enrollment,"
+  echo "and reboot back into Debian. The enabled A720 services should then start automatically."
+  echo
+  echo "Installed for kernels:$built_kernels"
+  exit 0
+fi
+
+if ! systemctl start a720-wmi-handshake.service; then
+  echo "Failed to load the A720 WMI module." >&2
+  echo "Systemd status:" >&2
+  systemctl status a720-wmi-handshake.service --no-pager -l >&2 || true
+  echo >&2
+  echo "Recent service log:" >&2
+  journalctl -u a720-wmi-handshake.service -b --no-pager -n 50 >&2 || true
+  exit 1
+fi
 
 if [ -d /sys/module/a720_wmi_handshake ]; then
   loaded_version=$(cat /sys/module/a720_wmi_handshake/version 2>/dev/null || true)
@@ -277,19 +346,7 @@ if [ -d /sys/module/a720_wmi_handshake ]; then
   fi
 fi
 
-if [ -d "$user_runtime" ]; then
-  su -s /bin/sh "$USER_NAME" -c \
-    "XDG_RUNTIME_DIR=$user_runtime systemctl --user daemon-reload"
-  su -s /bin/sh "$USER_NAME" -c \
-    "XDG_RUNTIME_DIR=$user_runtime systemctl --user enable --now a720-volume-bridge.service"
-else
-  install -d -o "$USER_UID" -g "$USER_GID" "$user_systemd/default.target.wants"
-  ln -sfn ../a720-volume-bridge.service \
-    "$user_systemd/default.target.wants/a720-volume-bridge.service"
-  chown -h "$USER_UID:$USER_GID" \
-    "$user_systemd/default.target.wants/a720-volume-bridge.service"
-  echo "User service enabled; it will start at next login."
-fi
+configure_user_bridge yes
 
 echo
 echo "Installed for kernels:$built_kernels"
